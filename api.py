@@ -8,6 +8,7 @@ from fastapi import FastAPI, File, HTTPException, UploadFile
 import numpy as np
 from PIL import Image, UnidentifiedImageError
 from pydantic import BaseModel, Field
+import torch
 from transformers import pipeline
 
 app = FastAPI(title="Termômetro da Aula")
@@ -17,10 +18,15 @@ detector = cv2.CascadeClassifier(
     cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
 )
 classificador = pipeline(
-    "image-classification", model="trpakov/vit-face-expression"
+    "image-classification",
+    model="trpakov/vit-face-expression",
+    device=0 if torch.cuda.is_available() else -1,  # usa a GPU se houver
 )
+# Aquecimento: a 1ª previsão é bem mais lenta, então fazemos ela já na subida
+classificador(Image.new("RGB", (224, 224)))
+print("Modelo pronto!")
 
-MAX_ROSTOS = 5 # limite de rostos analisados por imagem
+MAX_ROSTOS = 2  # limite de rostos analisados por imagem
 
 TRADUCAO = {
     "angry": "raiva",
@@ -73,9 +79,11 @@ class Avaliacao(AvaliacaoEntrada):
     polaridade: Polaridade
     data_hora: datetime
 
-avaliacoes: list[Avaliacao] = [] # "banco de dados" em memória"
 
-# Cria uma avaliação e guarda na lista 
+avaliacoes: list[Avaliacao] = []  # "banco de dados" em memória
+
+
+# Cria uma avaliação e guarda na lista
 def guardar(dados: AvaliacaoEntrada) -> Avaliacao:
     nova = Avaliacao(
         id=len(avaliacoes) + 1,
@@ -86,40 +94,45 @@ def guardar(dados: AvaliacaoEntrada) -> Avaliacao:
     avaliacoes.append(nova)
     return nova
 
+
 # ----------- Endpoints -----------
 # Detecta todos os rostos e classifica cada um (a imagem não é salva)
 @app.post("/analisar", response_model=Analise)
 def analisar(imagem: UploadFile = File(...), registrar: bool = False):
-    try: 
+    try:
         foto = Image.open(io.BytesIO(imagem.file.read())).convert("RGB")
-    except UnidentifiedImageError: 
-        raise HTTPException(status_code=400, detail="O arquivo enviado não é uma imagem")
+    except (UnidentifiedImageError, OSError):  # não é imagem ou está corrompida
+        raise HTTPException(status_code=400, detail="O arquivo enviado não é uma imagem válida")
 
     cinza = cv2.cvtColor(np.array(foto), cv2.COLOR_RGB2GRAY)
     caixas = detector.detectMultiScale(cinza, scaleFactor=1.1, minNeighbors=5, minSize=(48, 48))
-    caixas = sorted(caixas, key=lambda c: c[2] * c[3], reverse=True) [:MAX_ROSTOS]
+    caixas = sorted(caixas, key=lambda c: c[2] * c[3], reverse=True)[:MAX_ROSTOS]
     if len(caixas) == 0:
         return Analise(encontrou_rosto=False, total_rostos=0, rostos=[])
 
     caixas = [tuple(int(v) for v in c) for c in caixas]
-    recortes = [foto.crop((x,y,x + w, y + h)) for x,y,w,h in caixas]
-    previsoes = classificador(recortes) 
+    recortes = [foto.crop((x, y, x + w, y + h)) for x, y, w, h in caixas]
+    previsoes = classificador(recortes)
 
     rostos = []
     for caixa, previsao in zip(caixas, previsoes):
         melhor = previsao[0]
         emocao = TRADUCAO[melhor["label"].lower()]
         confianca = float(melhor["score"])
-        rostos.append(Rosto(emocao=emocao, confianca=confianca, polaridade=POLARIDADE[emocao], caixa=caixa))
-
-        if registrar: 
+        rostos.append(
+            Rosto(emocao=emocao, confianca=confianca, polaridade=POLARIDADE[emocao], caixa=caixa)
+        )
+        if registrar:  # registra cada rosto encontrado
             guardar(AvaliacaoEntrada(emocao=emocao, confianca=confianca))
-        return Analise(encontrou_rosto=True, total_rostos=len(rostos), rostos=rostos)
+
+    # Fora do laço: só responde depois de analisar TODOS os rostos
+    return Analise(encontrou_rosto=True, total_rostos=len(rostos), rostos=rostos)
 
 
 @app.post("/avaliacoes", response_model=Avaliacao, status_code=201)
 def criar_avaliacao(dados: AvaliacaoEntrada):
     return guardar(dados)
+
 
 @app.get("/avaliacoes", response_model=list[Avaliacao])
 def listar(polaridade: Polaridade | None = None):
@@ -127,12 +140,14 @@ def listar(polaridade: Polaridade | None = None):
         return [a for a in avaliacoes if a.polaridade == polaridade]
     return avaliacoes
 
+
 @app.get("/avaliacoes/{id}", response_model=Avaliacao)
 def buscar(id: int):
     for a in avaliacoes:
         if a.id == id:
             return a
     raise HTTPException(status_code=404, detail="Avaliação não encontrada")
+
 
 @app.get("/resumo")
 def resumo():
@@ -142,9 +157,11 @@ def resumo():
         "emocoes": dict(Counter(a.emocao for a in avaliacoes)),
     }
 
+
 @app.delete("/avaliacoes", status_code=204)
 def limpar():
     avaliacoes.clear()
+
 
 @app.get("/")
 def raiz():

@@ -7,11 +7,12 @@ import cv2
 import pandas as pd
 import requests
 import streamlit as st
-from PIL import Image
+from PIL import Image, UnidentifiedImageError
 
 API = "http://127.0.0.1:8000"
 PASTA_EXEMPLOS = Path(__file__).parent / "exemplos"
 INTERVALO = 2  # segundos entre uma análise e outra no modo ao vivo
+TEMPO_LIMITE = 30  # segundos esperando a API analisar (o modelo é lento no CPU)
 
 # Câmeras da sala: troque pelos IPs reais
 CAMERAS = {
@@ -69,7 +70,7 @@ def analisar(imagem, registrar=True):
         f"{API}/analisar",
         params={"registrar": str(registrar).lower()},
         files={"imagem": ("quadro.jpg", em_jpeg(imagem), "image/jpeg")},
-        timeout=15,
+        timeout=(3, TEMPO_LIMITE),  # (conectar, esperar resposta)
     )
     r.raise_for_status()
     return r.json()
@@ -149,6 +150,9 @@ def ao_vivo(camera):
     except requests.RequestException as erro:
         st.error(f"Não foi possível acessar a câmera '{camera}': {erro}")
         return
+    except UnidentifiedImageError:  # a câmera respondeu algo que não é imagem
+        st.error(f"A câmera '{camera}' não devolveu uma imagem válida.")
+        return
 
     if imagem is None:
         st.error("Não consegui ler a webcam. Ela está conectada e livre?")
@@ -199,8 +203,10 @@ def obter_foto():
 def resumo_da_turma():
     st.subheader("Resumo da turma")
     try:
-        resumo = requests.get(f"{API}/resumo", timeout=5).json()
-    except requests.ConnectionError:
+        r = requests.get(f"{API}/resumo", timeout=5)
+        r.raise_for_status()
+        resumo = r.json()
+    except requests.RequestException:  # fora do ar, lenta demais ou com erro
         st.error("API fora do ar. Rode antes: uvicorn api:app --reload")
         return
 
@@ -245,8 +251,9 @@ else:
         legenda = descrever(resposta)
         if resposta["encontrou_rosto"]:
             legenda += " · registrado na API" if nova else " · foto já registrada"
-        if esperado:  # na galeria, compara com o maior rosto da foto
-            acerto = "\u2705" if esperado == resposta["rostos"][0]["emocao"] else "\u274C"
+        # Na galeria, compara com o maior rosto da foto (só se achou algum rosto)
+        if esperado and resposta["encontrou_rosto"]:
+            acerto = "✅" if esperado == resposta["rostos"][0]["emocao"] else "❌"
             legenda += f" · {acerto} esperado: {esperado}"
         exibir(imagem, resposta, legenda)
 
